@@ -191,18 +191,29 @@ def vae_anomaly_for_row(row_dict: Dict[str, Any], vae_pack: Dict[str, Any]) -> T
 # -------------------------------------------------
 def query_influxdb():
     """
-    همان استریم قبلی؛ فقط دیکشنری کامل‌تری برمی‌گرداند تا اگر
-    فیچرهای VAE/assigner بیشتر از این ۵ مورد باشد، NaN ساخته شود.
+    Stream از سه bucket: cu_cp_bucket, du_bucket, cu_up_bucket
+    - فیلدهای با کاراکتر خاص با "..." کوت می‌شوند.
+    - join روی (ue_imsi_complete, time)
     """
     client = InfluxDBClient(host='localhost', port=8086, database='ns3_metrics')
     last_time_seen = "1970-01-01T00:00:00.000000Z"
 
     while True:
+        # --- CU-CP: پایه و زمان/UE ---
         cu_query = f"""
-            SELECT num_active_ues, l3_serving_sinr, l3_serving_sinr_3gpp, ue_imsi_complete, time,
-                   l3_neigh_id_1_cellid, l3_neigh_id_2_cellid, l3_neigh_id_3_cellid,
-                   l3_neigh_sinr_1, l3_neigh_sinr_2, l3_neigh_sinr_3
-            FROM cu_cp_bucket 
+            SELECT
+                num_active_ues,
+                l3_serving_sinr,
+                l3_serving_sinr_3gpp,
+                ue_imsi_complete,
+                time,
+                l3_neigh_id_1_cellid,
+                l3_neigh_id_2_cellid,
+                l3_neigh_id_3_cellid,
+                l3_neigh_sinr_1,
+                l3_neigh_sinr_2,
+                l3_neigh_sinr_3
+            FROM cu_cp_bucket
             WHERE time > '{last_time_seen}'
             ORDER BY time ASC
         """
@@ -212,43 +223,90 @@ def query_influxdb():
             time.sleep(QUERY_INTERVAL)
             continue
 
+        # --- DU: فقط نرخ DL UEThp (اسم با دابل‌کوت) ---
         du_query = """
-            SELECT tb_err_total_nbr_dl_1, rru_prb_used_dl, ue_imsi_complete, time
-            FROM du_bucket 
+            SELECT
+                "DRB.UEThpDl.UEID",
+                rru_prb_used_dl,
+                tb_err_total_nbr_dl_1,
+                ue_imsi_complete,
+                time
+            FROM du_bucket
             ORDER BY time ASC
         """
         du_points = list(client.query(du_query).get_points())
         du_lookup = {(p['ue_imsi_complete'], p['time']): p for p in du_points}
 
+        # --- CU-UP: سه فیچر PDCP (همه با دابل‌کوت) ---
+        cuup_query = """
+            SELECT
+                "DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)",
+                "Tot.PdcpSduNbrDl.UEID(txDlPackets)",
+                "DRB.PdcpSduDelayDl.UEID(pdcpLatency)",
+                ue_imsi_complete,
+                time
+            FROM cu_up_bucket
+            ORDER BY time ASC
+        """
+        cuup_points = list(client.query(cuup_query).get_points())
+        cuup_lookup = {(p['ue_imsi_complete'], p['time']): p for p in cuup_points}
+
         for cu_point in cu_points:
             ueid = cu_point['ue_imsi_complete']
-            time_str = cu_point['time']
-            if time_str > last_time_seen:
-                last_time_seen = time_str
+            t = cu_point['time']
 
-            du_point = du_lookup.get((ueid, time_str))
-            if not du_point:
+            # به‌روزرسانی نشانگر زمان با حاشیهٔ امن
+            if t > last_time_seen:
+                last_time_seen = t
+
+            du_point = du_lookup.get((ueid, t))
+            cuup_point = cuup_lookup.get((ueid, t))
+            if not du_point or not cuup_point:
+                # اگر یکی از باکت‌ها رکورد هم‌زمان نداشت، رد کن
                 continue
 
-            # ردیف داده‌ی واحد برای پردازش
+            # ردیف کامل با کلیدهایی دقیقاً مطابق باندل/مدل
             row = {
-                # فیچرهای قبلی
-                'numActiveUes': cu_point['num_active_ues'],
-                'L3 serving SINR': cu_point['l3_serving_sinr'],
-                'L3 serving SINR 3gpp': cu_point['l3_serving_sinr_3gpp'],
-                'RRU.PrbUsedDl': du_point['rru_prb_used_dl'],
-                'TB.ErrTotalNbrDl.1': du_point['tb_err_total_nbr_dl_1'],
                 # شناسه‌ها/زمان
                 'ueid': ueid,
-                'time': time_str,
-                # نِیبِرها
+                'time': t,
+
+                # پایه از CU-CP
+                'numActiveUes': cu_point.get('num_active_ues'),
+                'L3 serving SINR': cu_point.get('l3_serving_sinr'),
+                'L3 serving SINR 3gpp': cu_point.get('l3_serving_sinr_3gpp'),
                 'neighbor_id_1': cu_point.get('l3_neigh_id_1_cellid'),
                 'neighbor_id_2': cu_point.get('l3_neigh_id_2_cellid'),
                 'neighbor_id_3': cu_point.get('l3_neigh_id_3_cellid'),
                 'neighbor_sinr_1': cu_point.get('l3_neigh_sinr_1'),
                 'neighbor_sinr_2': cu_point.get('l3_neigh_sinr_2'),
                 'neighbor_sinr_3': cu_point.get('l3_neigh_sinr_3'),
+
+                # از DU
+                'RRU.PrbUsedDl': du_point.get('rru_prb_used_dl'),
+                'TB.ErrTotalNbrDl.1': du_point.get('tb_err_total_nbr_dl_1'),
+                'DRB.UEThpDl.UEID': du_point.get('DRB.UEThpDl.UEID'),
+
+                # از CU-UP (اسم‌ها را دقیق می‌گذاریم)
+                'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)': cuup_point.get('DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)'),
+                'Tot.PdcpSduNbrDl.UEID(txDlPackets)': cuup_point.get('Tot.PdcpSduNbrDl.UEID(txDlPackets)'),
+                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)': cuup_point.get('DRB.PdcpSduDelayDl.UEID(pdcpLatency)'),
             }
+
+            # تبدیل نرم به float برای فیلدهای عددی (از خطای type جلوگیری می‌کند)
+            for k in [
+                'numActiveUes','L3 serving SINR','L3 serving SINR 3gpp',
+                'RRU.PrbUsedDl','TB.ErrTotalNbrDl.1',
+                'DRB.UEThpDl.UEID',
+                'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)',
+                'Tot.PdcpSduNbrDl.UEID(txDlPackets)',
+                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)'
+            ]:
+                v = row.get(k, None)
+                if v is not None:
+                    try: row[k] = float(v)
+                    except: pass
+
             yield row
 
         time.sleep(QUERY_INTERVAL)
