@@ -8,7 +8,14 @@ from typing import Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 import joblib
-import pickle
+# Use pickle5 if available (can read protocol 5 on older Pythons)
+try:
+    import pickle5 as pickle
+    print("[BOOT] using pickle5")
+except ImportError:
+    import pickle
+    print("[BOOT] using std pickle (install 'pickle5' if protocol error)")
+
 import torch
 import torch.nn as nn
 from influxdb import InfluxDBClient
