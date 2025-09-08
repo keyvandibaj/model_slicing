@@ -232,47 +232,66 @@ def vae_anomaly_for_row(row_dict: Dict[str, Any], vae_pack: Dict[str, Any]) -> T
     return rec_err, y_hat
 def safe_load_pkl(path):
     """
-    Loads a pickle/joblib file even if it references unknown modules/classes like 'DRB'.
-    We remap any class from module 'DRB' (or submodules) to lightweight stubs so unpickling succeeds.
-    Then we normalize known fields to plain Python types.
+    Robust pickle loader:
+    - tries joblib/pickle
+    - if missing modules like 'DRB', remaps them to stub classes that accept any args
     """
-    # 1) ابتدا با joblib/pickle تلاش معمولی
+    import pickle as _pkl
+    import types
+
+    # 0) try joblib first
     try:
         return joblib.load(path)
-    except Exception as e1:
-        # اگر مشکل از نبودن ماژول DRB است، می‌ریم سراغ Unpickler سفارشی
-        msg = str(e1)
-        if "No module named 'DRB'" not in msg and "No module named \\x27DRB\\x27" not in msg:
-            # شاید pickle5 بخواد:
+    except Exception:
+        pass
+
+    # 1) try plain pickle
+    try:
+        with open(path, "rb") as f:
+            return _pkl.load(f)
+    except Exception:
+        pass
+
+    # 2) custom unpickler: map any class from module 'DRB' (or submodules) to a forgiving stub
+    def _make_stub(name):
+        # dynamic stub class that accepts any constructor args and state
+        cls = type(name, (object,), {})
+        def __init__(self, *args, **kwargs):
+            # accept anything, do nothing
+            pass
+        def __setstate__(self, state):
+            # accept pickled state dict/tuple/etc.
             try:
-                with open(path, "rb") as f:
-                    return pickle.load(f)
+                if isinstance(state, dict):
+                    self.__dict__.update(state)
+                else:
+                    # just keep it around for debugging, won't be used later
+                    self.__dict__["__state__"] = state
             except Exception:
                 pass
-        # ادامه می‌دیم با DRBUnpickler
+        # bind methods
+        setattr(cls, "__init__", __init__)
+        setattr(cls, "__setstate__", __setstate__)
+        return cls
 
-    # 2) Unpickler سفارشی: هر کلاس از module == 'DRB' یا prefix 'DRB.' را به یک کلاس ساختگی نگاشت می‌کند
+    class DRBUnpickler(_pkl.Unpickler):
+        def find_class(self, module, name):
+            # Any reference to 'DRB' module hierarchy -> return tolerant stub class
+            if module == "DRB" or module.startswith("DRB."):
+                return _make_stub(name)
+            return super().find_class(module, name)
+
     with open(path, "rb") as f:
-
-        class DRBUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                # هر چیزی از ماژول DRB یا زیربخش‌هاش، stub می‌شود
-                if module == "DRB" or module.startswith("DRB."):
-                    # کلاس ساختگی داینامیک با همان نام تا ساخت نمونه شکست نخورد
-                    return type(name, (object,), {})
-                # در غیر اینصورت رفتار عادی
-                return super().find_class(module, name)
-
         obj = DRBUnpickler(f).load()
 
-    # 3) نرمال‌سازی فیلدهای شناخته‌شده برای assigner
-    #    (اگر distance_metric به صورت Enum/آبجکت ذخیره شده بود -> str)
+    # Normalize known assigner fields if present
     if isinstance(obj, dict):
+        # distance_metric could be enum/object -> cast to str fallback
         if "distance_metric" in obj and not isinstance(obj["distance_metric"], str):
             try:
                 obj["distance_metric"] = str(obj["distance_metric"])
             except Exception:
-                obj["distance_metric"] = "euclidean"  # پیش‌فرض امن
+                obj["distance_metric"] = "euclidean"
     return obj
 
 
