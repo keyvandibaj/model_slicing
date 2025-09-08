@@ -232,11 +232,13 @@ def vae_anomaly_for_row(row_dict: Dict[str, Any], vae_pack: Dict[str, Any]) -> T
     return rec_err, y_hat
 def safe_load_pkl(path):
     """
-    Robust pickle loader:
-    - tries joblib/pickle
-    - if missing modules like 'DRB', remaps them to stub classes that accept any args
+    Robust loader for pickle/joblib files that may reference unknown modules/classes (e.g., 'DRB.*').
+    - Try joblib / pickle normally
+    - If that fails, use a custom Unpickler that maps ANY missing class to a tolerant stub
+      with __new__/__init__/__setstate__/__reduce__ to swallow pickled constructor/state.
     """
     import pickle as _pkl
+    import importlib
     import types
 
     # 0) try joblib first
@@ -252,48 +254,59 @@ def safe_load_pkl(path):
     except Exception:
         pass
 
-    # 2) custom unpickler: map any class from module 'DRB' (or submodules) to a forgiving stub
-    def _make_stub(name):
-        # dynamic stub class that accepts any constructor args and state
-        cls = type(name, (object,), {})
+    # 2) tolerant stub factory
+    def _make_stub(qualname):
+        # create a dynamic class that accepts any constructor and state
+        cls = types.new_class(qualname, (object,))
+        def __new__(c, *args, **kwargs):
+            # ignore constructor args from NEWOBJ/NEWOBJ_EX
+            return object.__new__(c)
         def __init__(self, *args, **kwargs):
-            # accept anything, do nothing
+            # swallow any args
             pass
         def __setstate__(self, state):
-            # accept pickled state dict/tuple/etc.
             try:
                 if isinstance(state, dict):
                     self.__dict__.update(state)
                 else:
-                    # just keep it around for debugging, won't be used later
-                    self.__dict__["__state__"] = state
+                    self.__dict__['_state'] = state
             except Exception:
                 pass
-        # bind methods
+        def __getstate__(self):
+            return getattr(self, '__dict__', {})
+        def __reduce__(self):
+            # basic reduce that re-creates empty instance + state
+            return (self.__class__, tuple(), self.__getstate__())
+        setattr(cls, "__new__", staticmethod(__new__))
         setattr(cls, "__init__", __init__)
         setattr(cls, "__setstate__", __setstate__)
+        setattr(cls, "__getstate__", __getstate__)
+        setattr(cls, "__reduce__", __reduce__)
         return cls
 
-    class DRBUnpickler(_pkl.Unpickler):
+    class TolerantUnpickler(_pkl.Unpickler):
         def find_class(self, module, name):
-            # Any reference to 'DRB' module hierarchy -> return tolerant stub class
-            if module == "DRB" or module.startswith("DRB."):
-                return _make_stub(name)
-            return super().find_class(module, name)
+            # try normal import first
+            try:
+                mod = importlib.import_module(module)
+                return getattr(mod, name)
+            except Exception:
+                # map ANY missing class to a tolerant stub
+                qual = f"{module}.{name}" if module else name
+                return _make_stub(qual)
 
     with open(path, "rb") as f:
-        obj = DRBUnpickler(f).load()
+        obj = TolerantUnpickler(f).load()
 
-    # Normalize known assigner fields if present
+    # Normalize common assigner fields if present
     if isinstance(obj, dict):
-        # distance_metric could be enum/object -> cast to str fallback
+        # distance_metric might be an enum/object -> stringify
         if "distance_metric" in obj and not isinstance(obj["distance_metric"], str):
             try:
                 obj["distance_metric"] = str(obj["distance_metric"])
             except Exception:
                 obj["distance_metric"] = "euclidean"
     return obj
-
 
 # -------------------------------------------------
 # InfluxDB stream (بدون تغییر اساسی در اسکلت)
