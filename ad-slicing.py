@@ -237,7 +237,7 @@ def query_influxdb():
         # --- DU: فقط نرخ DL UEThp (اسم با دابل‌کوت) ---
         du_query = """
             SELECT
-                "DRB.UEThpDl.UEID",
+                "drb_uethp_dl_ueid",
                 rru_prb_used_dl,
                 tb_err_total_nbr_dl_1,
                 ue_imsi_complete,
@@ -251,9 +251,9 @@ def query_influxdb():
         # --- CU-UP: سه فیچر PDCP (همه با دابل‌کوت) ---
         cuup_query = """
             SELECT
-                "DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)",
-                "Tot.PdcpSduNbrDl.UEID(txDlPackets)",
-                "DRB.PdcpSduDelayDl.UEID(pdcpLatency)",
+                "drb_pdcp_sdu_volume_dl_filter_ueid_tx_bytes",
+                "tot_pdcp_sdu_nbr_dl_ueid_tx_dl_packets",
+                "drb_pdcp_sdu_delay_dl_ueid_pdcp_latency",
                 ue_imsi_complete,
                 time
             FROM cu_up_bucket
@@ -296,12 +296,12 @@ def query_influxdb():
                 # از DU
                 'RRU.PrbUsedDl': du_point.get('rru_prb_used_dl'),
                 'TB.ErrTotalNbrDl.1': du_point.get('tb_err_total_nbr_dl_1'),
-                'DRB.UEThpDl.UEID': du_point.get('DRB.UEThpDl.UEID'),
+                'DRB.UEThpDl.UEID': du_point.get('drb_uethp_dl_ueid'),
 
                 # از CU-UP (اسم‌ها را دقیق می‌گذاریم)
-                'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)': cuup_point.get('DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)'),
-                'Tot.PdcpSduNbrDl.UEID(txDlPackets)': cuup_point.get('Tot.PdcpSduNbrDl.UEID(txDlPackets)'),
-                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)': cuup_point.get('DRB.PdcpSduDelayDl.UEID(pdcpLatency)'),
+                'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)': cuup_point.get('drb_pdcp_sdu_volume_dl_filter_ueid_tx_bytes'),
+                'Tot.PdcpSduNbrDl.UEID(txDlPackets)': cuup_point.get('tot_pdcp_sdu_nbr_dl_ueid_tx_dl_packets'),
+                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)': cuup_point.get('drb_pdcp_sdu_delay_dl_ueid_pdcp_latency'),
             }
 
             # تبدیل نرم به float برای فیلدهای عددی (از خطای type جلوگیری می‌کند)
