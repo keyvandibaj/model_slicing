@@ -1,5 +1,5 @@
-# ad-slicing.py  -- Hierarchical assigner + per-cluster VAE + Influx stream
-# ASCII-only prints for safe terminals. Tested with Python 3.8+.
+# ad-slicing.py  -- Hierarchical assigner (split files) + per-cluster VAE + Influx stream
+# ASCII-only prints for safe terminals.
 
 import os, sys, time, logging, traceback
 from pathlib import Path
@@ -8,14 +8,6 @@ from typing import Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 import joblib
-# Use pickle5 if available (can read protocol 5 on older Pythons)
-try:
-    import pickle5 as pickle
-    print("[BOOT] using pickle5")
-except ImportError:
-    import pickle
-    print("[BOOT] using std pickle (install 'pickle5' if protocol error)")
-
 import torch
 import torch.nn as nn
 from influxdb import InfluxDBClient
@@ -23,9 +15,9 @@ from influxdb import InfluxDBClient
 # =========================
 # Config
 # =========================
-QUERY_INTERVAL = 0.001  # seconds between polls
-MODELS_DIR = Path("mosels_dir")  # folder containing hierarchical_assigner*.pkl and vae_* files
-DEBUG = True  # set False to reduce stdout logs
+QUERY_INTERVAL = 0.001  # seconds
+MODELS_DIR = Path("mosels_dir")  # folder containing hier_*.pkl and VAE files
+DEBUG = True  # set False to reduce logs
 
 # =========================
 # Logging
@@ -35,57 +27,6 @@ logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s - %(message)s'
 )
-
-# =========================
-# Unicode-safe stdout (optional)
-# =========================
-try:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
-# =======================================================
-# Stub importer for unknown modules referenced in pickles
-# e.g., DRB.* that may exist in legacy environments
-# =======================================================
-import types, importlib.abc, importlib.util
-
-class _StubLoader(importlib.abc.Loader):
-    def create_module(self, spec):
-        mod = types.ModuleType(spec.name)
-        def __getattr__(name):
-            # tolerant stub class: accepts any ctor args and state
-            cls = type(name, (object,), {})
-            def __new__(c, *a, **k): return object.__new__(c)
-            def __init__(self, *a, **k): pass
-            def __setstate__(self, state):
-                try:
-                    if isinstance(state, dict):
-                        self.__dict__.update(state)
-                    else:
-                        self.__dict__['_state'] = state
-                except Exception:
-                    pass
-            cls.__new__ = staticmethod(__new__)
-            cls.__init__ = __init__
-            cls.__setstate__ = __setstate__
-            return cls
-        mod.__getattr__ = __getattr__  # PEP 562
-        return mod
-    def exec_module(self, module):
-        return
-
-class _StubFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        # Stub DRB and any submodules DRB.*
-        if fullname == "DRB" or fullname.startswith("DRB."):
-            return importlib.util.spec_from_loader(fullname, _StubLoader())
-        return None
-
-if not any(isinstance(f, _StubFinder) for f in sys.meta_path):
-    sys.meta_path.insert(0, _StubFinder())
 
 # =========================
 # VAE (as provided)
@@ -119,57 +60,67 @@ class VAE(nn.Module):
         return recon, mu, logvar
 
 # =========================
-# Assigner loader (clean-first)
+# Assigner loader from split files
 # =========================
 NEEDED_KEYS = {"selected_columns", "scaler", "centroids", "invs", "distance_metric"}
 
-def _clean_assigner_dict(b: dict) -> dict:
-    """Keep only required keys and normalize types."""
-    clean = {}
-    clean["selected_columns"] = list(b["selected_columns"])
-    clean["scaler"] = b["scaler"]
-    clean["centroids"] = np.asarray(b["centroids"])
-    clean["invs"] = [np.asarray(m) for m in b["invs"]]
-    dm = b.get("distance_metric", "euclidean")
-    clean["distance_metric"] = str(dm)
-    return clean
-
-def load_assigner_auto(models_dir: Path) -> dict:
-    """Load hierarchical assigner:
-       1) if clean exists -> load it
-       2) else load legacy (with stubbed imports), then write clean and return it
-    """
+def load_assigner_split(models_dir: Path) -> dict:
+    """Load hierarchical assigner parts from separate files under models_dir."""
     models_dir = Path(models_dir)
-    clean_path = models_dir / "hierarchical_assigner_clean.pkl"
-    raw_path   = models_dir / "hierarchical_assigner.pkl"
 
-    if clean_path.exists():
-        b = joblib.load(clean_path)
-        missing = NEEDED_KEYS - set(b.keys())
-        if missing:
-            raise ValueError("[assigner_clean] missing keys: {}".format(missing))
-        return b
+    sel_path  = models_dir / "hier_selected_columns.pkl"
+    sc_path   = models_dir / "hier_scaler.pkl"
+    cen_path  = models_dir / "hier_centroids.pkl"
+    inv_path  = models_dir / "hier_invs.pkl"
+    dm_path   = models_dir / "hier_distance_metric.pkl"
+    cov_path  = models_dir / "hier_covs.pkl"          # optional
+    mdl_path  = models_dir / "hier_model.pkl"         # optional
 
-    # legacy path
-    try:
-        b_raw = joblib.load(raw_path)
-    except Exception:
-        with open(raw_path, "rb") as f:
-            b_raw = pickle.load(f)
+    if not sel_path.exists() or not sc_path.exists() or not cen_path.exists() or not inv_path.exists() or not dm_path.exists():
+        raise FileNotFoundError("Missing one or more hier_* files. Expected: hier_selected_columns.pkl, hier_scaler.pkl, hier_centroids.pkl, hier_invs.pkl, hier_distance_metric.pkl")
 
-    b = _clean_assigner_dict(b_raw)
-    try:
-        joblib.dump(b, clean_path, compress=3)
-        print("[ASSIGNER] wrote clean file:", clean_path)
-    except Exception as e:
-        print("[ASSIGNER][warn] could not write clean file:", e)
-    return b
+    selected_columns = joblib.load(sel_path)
+    scaler           = joblib.load(sc_path)
+    centroids        = joblib.load(cen_path)
+    invs             = joblib.load(inv_path)
+    distance_metric  = joblib.load(dm_path)
+
+    # normalize types
+    selected_columns = list(selected_columns)
+    centroids = np.asarray(centroids)
+    invs = [np.asarray(m) for m in invs]
+    distance_metric = str(distance_metric).lower().strip()
+
+    # optional loads (not required by inference)
+    covs  = joblib.load(cov_path) if cov_path.exists() else None
+    _mdl  = joblib.load(mdl_path) if mdl_path.exists() else None
+
+    assigner = {
+        "selected_columns": selected_columns,
+        "scaler": scaler,
+        "centroids": centroids,
+        "invs": invs,
+        "distance_metric": distance_metric,
+        "covs": covs,         # unused unless you need it
+        "agg_model": _mdl,    # unused by this script
+    }
+
+    # sanity checks
+    if distance_metric not in ("euclidean", "mahalanobis"):
+        print("[ASSIGNER][warn] distance_metric is '{}', defaulting to 'euclidean'".format(distance_metric))
+        assigner["distance_metric"] = "euclidean"
+
+    K = centroids.shape[0]
+    if assigner["distance_metric"] == "mahalanobis" and (invs is None or len(invs) != K):
+        raise ValueError("For mahalanobis, hier_invs.pkl must contain K inverse cov matrices.")
+
+    return assigner
 
 # =========================
 # Utils
 # =========================
 def _align_columns_for_scaler(df: pd.DataFrame, cols_expected: list, scaler) -> pd.DataFrame:
-    """Align df columns to scaler expected order, create missing, coerce to numeric, fill NaN with median."""
+    """Align to scaler/expected order, create missing cols, coerce numeric, fill NaN median."""
     if hasattr(scaler, "feature_names_in_"):
         expected = list(scaler.feature_names_in_)
     else:
@@ -188,7 +139,7 @@ def _align_columns_for_scaler(df: pd.DataFrame, cols_expected: list, scaler) -> 
     return X
 
 def load_cluster_vaes(models_dir: Path, K: int) -> Dict[int, Dict[str, Any]]:
-    """Load per-cluster VAE packs: (vae_model_class{k}.pth, vae_bundle_class{k}.pkl)."""
+    """Load (vae_model_class{k}.pth + vae_bundle_class{k}.pkl) per cluster."""
     vaes = {}
     for k in range(K):
         pth = models_dir / f"vae_model_class{k}.pth"
@@ -261,7 +212,7 @@ def vae_anomaly_for_row(row_dict: Dict[str, Any], vae_pack: Dict[str, Any]) -> T
 def query_influxdb():
     """
     Streams joined rows from:
-      - cu_cp_bucket: base + neighbors
+      - cu_cp_bucket
       - du_bucket: "drb_uethp_dl_ueid", rru_prb_used_dl, tb_err_total_nbr_dl_1
       - cu_up_bucket: "drb_pdcp_sdu_volume_dl_filter_ueid_tx_bytes",
                       "tot_pdcp_sdu_nbr_dl_ueid_tx_dl_packets",
@@ -333,7 +284,6 @@ def query_influxdb():
             if not du_point or not cuup_point:
                 continue
 
-            # Build row with keys matching your models/bundles
             row = {
                 'ueid': ueid,
                 'time': t,
@@ -360,7 +310,7 @@ def query_influxdb():
                 'DRB.PdcpSduDelayDl.UEID(pdcpLatency)': cuup_point.get('drb_pdcp_sdu_delay_dl_ueid_pdcp_latency'),
             }
 
-            # Soft-cast to float when possible
+            # soft-cast numerics
             for k in [
                 'numActiveUes','L3 serving SINR','L3 serving SINR 3gpp',
                 'RRU.PrbUsedDl','TB.ErrTotalNbrDl.1',
@@ -381,12 +331,11 @@ def query_influxdb():
         time.sleep(QUERY_INTERVAL)
 
 # =========================
-# Dry-run: quick self-test without Influx
+# Dry-run
 # =========================
 def dry_run_once():
-    """Run one synthetic example through the pipeline to verify artifacts."""
     try:
-        assigner = load_assigner_auto(MODELS_DIR)
+        assigner = load_assigner_split(MODELS_DIR)
         K = int(assigner["centroids"].shape[0])
         vaes = load_cluster_vaes(MODELS_DIR, K)
         print("[DRY] clusters:", K, "| VAE packs:", sorted(list(vaes.keys())))
@@ -432,14 +381,13 @@ def main():
             except Exception as e:
                 print("[INIT][WARN] listdir failed:", e)
 
-        print("[INIT] Loading assigner...")
-        assigner = load_assigner_auto(MODELS_DIR)
+        print("[INIT] Loading assigner (split files)...")
+        assigner = load_assigner_split(MODELS_DIR)
         K = int(assigner["centroids"].shape[0])
         print("[INIT] Clusters (K):", K)
-        print("[CHECK] keys:", sorted(list(assigner.keys())))
-        print("[CHECK] centroids shape:", getattr(assigner["centroids"], "shape", None))
-        print("[CHECK] invs len:", len(assigner["invs"]))
         print("[CHECK] distance_metric:", assigner["distance_metric"])
+        print("[CHECK] centroids shape:", assigner["centroids"].shape)
+        print("[CHECK] invs len:", len(assigner["invs"]))
 
         print("[INIT] Loading VAEs...")
         vaes = load_cluster_vaes(MODELS_DIR, K)
@@ -514,3 +462,4 @@ if __name__ == "__main__":
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     print("[BOOT] __main__ guard active. Calling main() ...")
     main()
+
