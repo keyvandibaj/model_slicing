@@ -16,11 +16,52 @@ import joblib
 import torch
 import torch.nn as nn
 from influxdb import InfluxDBClient
+import sys, traceback
+DEBUG = True
+print("[BOOT] ad-slicing.py starting…")
+print("[BOOT] Python:", sys.version)
+
 # --- add this at the very top with imports ---
 try:
     import pickle5 as pickle
 except ImportError:
     import pickle
+def dry_run_once():
+    """بدون اتصال به Influx یک رکورد آزمایشی می‌سازد و پایپ‌لاین را تست می‌کند."""
+    try:
+        assigner = load_assigner(MODELS_DIR / "hierarchical_assigner.pkl")
+        K = int(assigner["centroids"].shape[0])
+        vaes = load_cluster_vaes(MODELS_DIR, K)
+        print("[DRY] clusters:", K, "| VAE packs:", sorted(list(vaes.keys())))
+
+        # یک ردیف آزمایشی حداقلی (کلیدها باید با مدل/باندل تو سازگار باشند)
+        row = {
+            'ueid': 123456,
+            'time': "1970-01-01T00:00:01Z",
+            'numActiveUes': 1.0,
+            'L3 serving SINR': 10.0,
+            'L3 serving SINR 3gpp': 8.0,
+            'neighbor_id_1': None, 'neighbor_id_2': None, 'neighbor_id_3': None,
+            'neighbor_sinr_1': None, 'neighbor_sinr_2': None, 'neighbor_sinr_3': None,
+            'RRU.PrbUsedDl': 0.1,
+            'TB.ErrTotalNbrDl.1': 0.0,
+            # چهار فیچر PDCP/UEThp که گفتی:
+            'DRB.UEThpDl.UEID': 50.0,
+            'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)': 1000.0,
+            'Tot.PdcpSduNbrDl.UEID(txDlPackets)': 10.0,
+            'DRB.PdcpSduDelayDl.UEID(pdcpLatency)': 5.0,
+        }
+
+        k = assign_cluster_for_row(row, assigner)
+        print("[DRY] assigned cluster:", k)
+        if k not in vaes:
+            print("[DRY][WARN] No VAE pack for cluster", k)
+            return
+        rec_err, y_hat = vae_anomaly_for_row(row, vaes[k])
+        print(f"[DRY] rec_err={rec_err:.6f}  thr={vaes[k]['threshold']:.6f}  pred={y_hat}")
+    except Exception as e:
+        print("[DRY][ERROR]", e)
+        traceback.print_exc()
 
 # -------------------------------------------------
 # Logging
@@ -327,48 +368,52 @@ def query_influxdb():
 # -------------------------------------------------
 def main():
     try:
+        print("[INIT] MODELS_DIR:", MODELS_DIR.resolve())
+        if not MODELS_DIR.exists():
+            print("[INIT][ERROR] MODELS_DIR not found!")
+        else:
+            try:
+                print("[INIT] MODELS_DIR contents:", os.listdir(MODELS_DIR))
+            except Exception as e:
+                print("[INIT][WARN] listdir failed:", e)
+
         # 1) لود assigner
-        print("[INIT] Loading assigner...")
+        print("[INIT] Loading assigner…")
         assigner_path = MODELS_DIR / "hierarchical_assigner.pkl"
-        print(f"[INIT] Assigner path: {assigner_path}")
+        print("[INIT] Assigner path:", assigner_path)
         assigner = load_assigner(assigner_path)
         K = int(assigner["centroids"].shape[0])
-        print(f"[INIT] Clusters (K): {K}")
+        print("[INIT] Clusters (K):", K)
 
         # 2) لود VAEهای هر خوشه
-        print(f"[INIT] Loading per-cluster VAEs from: {MODELS_DIR}")
+        print("[INIT] Loading VAEs…")
         vaes = load_cluster_vaes(MODELS_DIR, K)
-        print(f"[INIT] Loaded VAE packs for clusters: {sorted(list(vaes.keys()))}")
+        print("[INIT] Loaded VAE packs:", sorted(list(vaes.keys())))
 
-        print(f"\nStarting stream (every {QUERY_INTERVAL}s) ...\n"
-              f"Loaded clusters: {K} | VAE packs: {sorted(list(vaes.keys()))}\n")
+        # 3) یک Dry-run قبل از استریم
+        print("[INIT] Running DRY-RUN once…")
+        dry_run_once()
+        print("[INIT] DRY-RUN done.")
+
+        print(f"\n[RUN] Starting stream (every {QUERY_INTERVAL}s)…\n")
         print("Time                          | UEID   | Cluster | rec_err |    thr | ServingSINR | Neigh( id:sinr, ... )")
         print("-" * 130)
 
-        # 3) حلقهٔ استریم
+        # 4) استریم واقعی
         for row in query_influxdb():
             try:
                 if DEBUG:
-                    # کلیدها و چند مقدار مهم برای دیباگ
-                    print("[ROW] keys:", list(row.keys())[:8], "... total:", len(row))
-                    print("[ROW] preview:", {k: row.get(k) for k in ['time','ueid','L3 serving SINR','DRB.UEThpDl.UEID'] if k in row})
+                    print("[ROW] keys:", list(row.keys())[:8], "… total:", len(row))
 
-                # A) تعیین کلاستر
                 k = assign_cluster_for_row(row, assigner)
-                if DEBUG:
-                    print(f"[CLUSTER] assigned = {k}")
-
-                # B) اگر VAE آن کلاستر موجود نیست → نادیده بگیر (یا نرمال فرض کن)
                 if k not in vaes:
                     if DEBUG:
                         print(f"[WARN] No VAE pack for cluster {k}. Skipping row.")
                     continue
 
-                # C) اجرای VAE همان کلاستر
                 rec_err, y_hat = vae_anomaly_for_row(row, vaes[k])
                 thr = vaes[k]['threshold']
 
-                # D) پرینت مختصر
                 serving_sinr = row.get('L3 serving SINR', None)
                 s_sinr_str = f"{serving_sinr:.2f}" if isinstance(serving_sinr, (int, float)) else "N/A"
                 neigh_str = (
@@ -378,12 +423,11 @@ def main():
                 )
 
                 print(f"{row['time']} | {int(row['ueid']):6d} | {k:^7d} | "
-                      f"{rec_err:7.3f} | {thr:7.3f} | {s_sinr_str:>11} | {neigh_str}")
+                      f"{rec_err:9.4f} | {thr:9.4f} | {s_sinr_str:>11} | {neigh_str}")
 
-                # E) اگر آنومالی → لاگ + هشدار
                 if y_hat == 1:
                     msg = (f"UE {int(row['ueid'])} anomalous at {row['time']} "
-                           f"(cluster={k}, rec_err={rec_err:.3f}, thr={thr:.3f}); "
+                           f"(cluster={k}, rec_err={rec_err:.4f}, thr={thr:.4f}); "
                            f"ServingSINR={s_sinr_str}; Neigh={neigh_str}; "
                            f"RowKeys={list(row.keys())}")
                     logging.warning(msg)
@@ -392,24 +436,31 @@ def main():
                 time.sleep(QUERY_INTERVAL)
 
             except Exception as inner_e:
-                # چاپ خط و استک‌تریس دقیق برای هر ردیف
                 print("[ERROR] Iteration error:", inner_e)
                 traceback.print_exc()
-                # برای دیباگ محتوای ردیف را کامل چاپ کن
                 try:
+                    from pprint import pformat
                     print("[ERROR] Offending row dump:\n", pformat(row))
                 except Exception:
                     pass
                 time.sleep(0.5)
 
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nShutting down…")
 
     except Exception as outer_e:
         print("[CRITICAL] Fatal error:", outer_e)
         traceback.print_exc()
-        # اطلاعات اضافه دربارهٔ آرتیفکت‌ها و وضعیت لود
         try:
             print("[CRITICAL] MODELS_DIR contents:", os.listdir(MODELS_DIR))
         except Exception:
             pass
+if __name__ == "__main__":
+    # خروجی Unbuffered برای دیدن فوری پرینت‌ها
+    try:
+        import os
+        os.environ["PYTHONUNBUFFERED"] = "1"
+    except Exception:
+        pass
+    print("[BOOT] __main__ guard active. Calling main() …")
+    main()
