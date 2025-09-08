@@ -16,6 +16,11 @@ import joblib
 import torch
 import torch.nn as nn
 from influxdb import InfluxDBClient
+# --- add this at the very top with imports ---
+try:
+    import pickle5 as pickle
+except ImportError:
+    import pickle
 
 # -------------------------------------------------
 # Logging
@@ -103,7 +108,8 @@ def load_assigner(assigner_path: Path) -> Dict[str, Any]:
     انتظار: فایل pkl با کلیدهای:
       selected_columns, scaler, centroids, invs, distance_metric
     """
-    b = joblib.load(assigner_path)
+    b = safe_load_pkl(assigner_path)
+    #b = joblib.load(assigner_path)
     required = {"selected_columns", "scaler", "centroids", "invs", "distance_metric"}
     missing = required - set(b.keys())
     if missing:
@@ -124,10 +130,12 @@ def load_cluster_vaes(models_dir: Path, K: int) -> Dict[int, Dict[str, Any]]:
         if not pth.exists() or not pkl.exists():
             logging.warning(f"[INIT] Missing VAE files for cluster {k}: {pth.name} / {pkl.name}")
             continue
-        bundle = joblib.load(pkl)
+        bundle = safe_load_pkl(pkl)
+        #bundle = joblib.load(pkl)
         feats, scaler, thr = bundle["features"], bundle["scaler"], float(bundle["threshold"])
         vae = VAE(input_dim=len(feats))
-        vae.load_state_dict(torch.load(pth, map_location="cpu"))
+        vae.load_state_dict(torch.load(pth, map_location="cpu", pickle_module=pickle))
+        #vae.load_state_dict(torch.load(pth, map_location="cpu"))
         vae.eval()
         vaes[k] = {"vae": vae, "features": feats, "scaler": scaler, "threshold": thr}
     if not vaes:
@@ -185,6 +193,9 @@ def vae_anomaly_for_row(row_dict: Dict[str, Any], vae_pack: Dict[str, Any]) -> T
         rec_err = float(((recon - x)**2).mean().item())
     y_hat = int(rec_err > thr)
     return rec_err, y_hat
+def safe_load_pkl(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 # -------------------------------------------------
 # InfluxDB stream (بدون تغییر اساسی در اسکلت)
