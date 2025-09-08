@@ -1,8 +1,6 @@
 # ad-slicing.py  -- Hierarchical assigner (split files) + per-cluster VAE + Influx stream
 # ASCII-only prints for safe terminals.
-import sys
-import pickle5 as pickle
-sys.modules['pickle'] = pickle
+
 import os, sys, time, logging, traceback
 from pathlib import Path
 from typing import Tuple, Dict, Any
