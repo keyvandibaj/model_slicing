@@ -219,7 +219,7 @@ def query_influxdb():
                       "drb_pdcp_sdu_delay_dl_ueid_pdcp_latency"
     Join key: (ue_imsi_complete, time)
     """
-    client = InfluxDBClient(host='localhost', port=8086, database='ns3_metrics')
+    client = InfluxDBClient(host='influxdb', port=8086, database='ns3_metrics')
     last_time_seen = "1970-01-01T00:00:00.000000Z"
 
     while True:
