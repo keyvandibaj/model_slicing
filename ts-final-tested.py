@@ -36,7 +36,7 @@ COMMAND_TEMPLATE = '''{grpcurl} -plaintext -d "{{ \\
         \\"TargetCellID\\": \\"{target_cell}\\" \\
     }}, \\
     \\"RICControlAckReqVal\\": 0 \\
-}}" 10.244.0.120:7777 rc.MsgComm.SendRICControlReqServiceGrpc'''
+}}" 10.244.0.14:7777 rc.MsgComm.SendRICControlReqServiceGrpc'''
 
 def compute_target_cell(cell_id: int) -> str:
     """
