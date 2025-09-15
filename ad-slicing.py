@@ -502,3 +502,10 @@ def main():
             print("[CRITICAL] MODELS_DIR contents:", os.listdir(MODELS_DIR))
         except Exception:
             pass
+# =========================
+# Entry
+# =========================
+if __name__ == "__main__":
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    print("[BOOT] __main__ guard active. Calling main() ...", flush=True)
+    main()
