@@ -14,6 +14,14 @@ from influxdb import InfluxDBClient
 
 # =========================
 # Config
+# --- Slice/Cluster ↔ CellID mapping ---
+CLUSTER_TO_CELLID = {0: 2, 1: 3, 2: 4}
+CLUSTER_NAME = {0: "eMBB", 1: "uRLLC", 2: "mMTC"}
+CELLID_NAME = {2: "eMBB", 3: "uRLLC", 4: "mMTC"}
+
+def _fmt_num(val):
+    return f"{val:.2f}" if isinstance(val, (int, float)) else "N/A"
+
 # =========================
 QUERY_INTERVAL = 0.001  # seconds
 MODELS_DIR = Path("mosels_dir")  # folder containing hier_*.pkl and VAE files
@@ -236,6 +244,7 @@ def query_influxdb():
                 l3_neigh_sinr_1,
                 l3_neigh_sinr_2,
                 l3_neigh_sinr_3
+                l3_serving_id_m_cellid
             FROM cu_cp_bucket
             WHERE time > '{last_time_seen}'
             ORDER BY time ASC
@@ -298,6 +307,7 @@ def query_influxdb():
                 'neighbor_sinr_1': cu_point.get('l3_neigh_sinr_1'),
                 'neighbor_sinr_2': cu_point.get('l3_neigh_sinr_2'),
                 'neighbor_sinr_3': cu_point.get('l3_neigh_sinr_3'),
+                'serving_cell_id': cu_point.get('l3_serving_id_m_cellid'),
 
                 # DU
                 'RRU.PrbUsedDl': du_point.get('rru_prb_used_dl'),
@@ -317,7 +327,8 @@ def query_influxdb():
                 'DRB.UEThpDl.UEID',
                 'DRB.PdcpSduVolumeDl_Filter.UEID(txBytes)',
                 'Tot.PdcpSduNbrDl.UEID(txDlPackets)',
-                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)'
+                'DRB.PdcpSduDelayDl.UEID(pdcpLatency)',
+                'serving_cell_id'
             ]:
                 v = row.get(k, None)
                 if v is not None:
@@ -427,11 +438,48 @@ def main():
                     row['time'], int(row['ueid']), k, rec_err, thr, s_sinr_str, neigh_str))
 
                 if y_hat == 1:
-                    msg = ("UE {} anomalous at {} (cluster={}, rec_err={:.4f}, thr={:.4f}); "
-                           "ServingSINR={}; Neigh={}; RowKeys={}").format(
-                        int(row['ueid']), row['time'], k, rec_err, thr, s_sinr_str, neigh_str, list(row.keys()))
-                    logging.warning(msg)
-                    print("\n[ALERT] {}\n".format(msg))
+                    # 1) نمایش هر آنومالی VAE روی ترمینال (مثل قبل)
+                    print(
+                        "\n[ALERT] UE {} anomalous at {} (cluster={}, rec_err={:.4f}, thr={:.4f}); "
+                        "ServingSINR={}; Neigh={}\n".format(
+                            int(row['ueid']), row['time'], k, rec_err, thr, s_sinr_str, neigh_str
+                        )
+                    )
+
+                    # 2) فقط اگر CellID فعلی با انتظار کلاستر نمی‌خواند → در فایل لاگ بنویس
+                    expected_cell = CLUSTER_TO_CELLID.get(int(k))
+                    current_cell = row.get('serving_cell_id', None)
+
+                    # نرم‌کستِ CellID
+                    try:
+                        current_cell = int(float(current_cell)) if current_cell is not None else None
+                    except Exception:
+                        current_cell = None
+
+                    if current_cell is None or expected_cell is None:
+                        if DEBUG:
+                            print(f"[SKIP-LOG] UE {int(row['ueid'])}: missing cell info "
+                                  f"(current_cell={current_cell}, expected_cell={expected_cell})")
+                    else:
+                        if current_cell != int(expected_cell):
+                            log_line = (
+                                "Mismatch: UE ID {ueid} | time {t} | "
+                                "Cluster={k}({kname}) -> expected CellID {exp}({expn}) | "
+                                "Current CellID {cur}({curn})"
+                            ).format(
+                                ueid=int(row['ueid']),
+                                t=row['time'],
+                                k=int(k), kname=CLUSTER_NAME.get(int(k), "unknown"),
+                                exp=int(expected_cell), expn=CELLID_NAME.get(int(expected_cell), "unknown"),
+                                cur=int(current_cell), curn=CELLID_NAME.get(int(current_cell), "unknown"),
+                            )
+                            logging.warning(log_line)
+                            if DEBUG:
+                                print("[LOGGED] " + log_line)
+                        else:
+                            if DEBUG:
+                                print(f"[OK-MATCH] UE {int(row['ueid'])}: cluster {k} ↔ CellID {current_cell} "
+                                      f"({CELLID_NAME.get(int(current_cell), 'unknown')})")
 
                 time.sleep(QUERY_INTERVAL)
 
@@ -454,12 +502,3 @@ def main():
             print("[CRITICAL] MODELS_DIR contents:", os.listdir(MODELS_DIR))
         except Exception:
             pass
-
-# =========================
-# Entry
-# =========================
-if __name__ == "__main__":
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    print("[BOOT] __main__ guard active. Calling main() ...")
-    main()
-
