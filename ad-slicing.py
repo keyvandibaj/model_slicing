@@ -243,7 +243,7 @@ def query_influxdb():
                 l3_neigh_id_3_cellid,
                 l3_neigh_sinr_1,
                 l3_neigh_sinr_2,
-                l3_neigh_sinr_3
+                l3_neigh_sinr_3,
                 l3_serving_id_m_cellid
             FROM cu_cp_bucket
             WHERE time > '{last_time_seen}'
